@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 import jsonlines
 from lingua import LanguageDetector, LanguageDetectorBuilder
 from tqdm import tqdm
+from typing import Optional
 
 
 def pdf_metadata_refine(metadata: dict):
@@ -38,16 +39,17 @@ class PDFContent(BaseModel):
     file_available: bool = Field(
         description="Whether the PDF file is available", default=False
     )
-    metadata: dict = Field(description="The metadata of the PDF file", default={})
+    metadata: dict = Field(default_factory=dict, description="The metadata of the PDF file")
     timestamp: str = Field(description="The timestamp of the PDF file", default="")
     language: str = Field(description="The language of the PDF file", default="")
-    text: list[str] = Field(description="The text of the PDF file", default=[])
-    xref: list[str] = Field(description="The xref of the PDF file", default=[])
+    text: list[str] = Field(default_factory=list, description="The text of the PDF file")
+    xref: list[str] = Field(default_factory=list, description="The xref of the PDF file")
+    toc: list[dict] = Field(default_factory=list, description="The toc of the PDF file")
 
     @staticmethod
     def from_file(
         file_path: str, is_lan_detect: bool = False, detector: LanguageDetector = None
-    ):
+    ) -> Optional[‘PDFContent]:
         file_path = Path(file_path).absolute()
         try:
             doc = pymupdf.open(file_path)
@@ -58,12 +60,30 @@ class PDFContent(BaseModel):
                 language = str(detector.detect_language_of(" ".join(text)).name).lower()
             else:
                 language = "None"
+            
+            # xref
             xref = []
             for xref_idx in range(1, doc.xref_length()):
                 exists, xref_key = doc.xref_get_key(xref_idx, "Subtype")
                 if exists and xref_key != "null":
                     xref.append(xref_key)
             xref = list(set(xref))
+
+            # toc
+            toc = doc.get_toc()
+            pdf_content_toc = [
+                {
+                    "level": item[0],  # 层级级别 (1, 2, 3, ...)
+                    "title": item[1],  # 标题文本
+                    "page": item[2],  # 页码
+                }
+                for item in toc
+            ]
+            toc = [
+                f"{item['level']}|||{item['title']}|||{item['page']}"
+                for item in pdf_content_toc
+            ]
+
         except Exception as e:
             logger.error(f"Error reading PDF file {file_path}: {e}")
             return None
