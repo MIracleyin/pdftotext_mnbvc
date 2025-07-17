@@ -9,18 +9,19 @@ import jsonlines
 from lingua import LanguageDetector, LanguageDetectorBuilder
 from tqdm import tqdm
 from typing import Optional, Dict, List, Any, Set
+import base64
 
 
 def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Refine PDF metadata by converting date strings to timestamps.
-    
+
     Args:
         metadata: Raw PDF metadata dictionary
-        
+
     Returns:
         Dict with date fields converted to timestamps
-        
+
     Examples:
         >>> metadata = {"creationDate": "D:20240101120000+00'00'"}
         >>> refined = pdf_metadata_refine(metadata)
@@ -52,7 +53,7 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
 class PDFContent(BaseModel):
     """
     A model representing the extracted content from a PDF file.
-    
+
     Attributes:
         file_path: The absolute path to the PDF file
         file_size: The size of the PDF file in MB
@@ -64,6 +65,7 @@ class PDFContent(BaseModel):
         xref: The cross-reference table entries
         toc: The table of contents entries
     """
+
     file_path: str = Field(description="The absolute path to the PDF file", default="")
     file_size: float = Field(description="The size of the PDF file, in MB", default=0.0)
     file_available: bool = Field(
@@ -80,75 +82,147 @@ class PDFContent(BaseModel):
     xref: List[str] = Field(
         default_factory=list, description="The xref of the PDF file"
     )
-    toc: List[Dict[str, Any]] = Field(
+    page: List[str] = Field(
+        default_factory=list,
+        description="The page image of the PDF file",  # base64 encoded 低分辨率，减少体积
+    )
+    toc: List[str] = Field(
         default_factory=list, description="The table of contents of the PDF file"
     )
 
-    @staticmethod
-    def from_file(
-        file_path: str, is_lan_detect: bool = False, detector: LanguageDetector = None
-    ) -> Optional["PDFContent"]:
+    def _extract_text(self, doc: pymupdf.Document) -> List[str]:
         """
-        Reads a PDF file and extracts its content.
-        
+        Extracts text from all pages of the PDF document.
+
         Args:
-            file_path: The absolute path to the PDF file.
-            is_lan_detect: Whether to detect the language of the text.
-            detector: An optional LanguageDetector instance.
-            
+            doc: The opened pymupdf Document object.
         Returns:
-            A PDFContent object containing the extracted information, or None if an error occurs.
+            List of text strings, one per page.
         """
-        file_path = Path(file_path).absolute()
-        
-        # Early check for file existence
-        if not file_path.exists():
-            logger.error(f"PDF file does not exist: {file_path}")
-            return None
-        
         try:
-            doc = pymupdf.open(file_path)
-            metadata = doc.metadata
-            timestamp = int(datetime.now().timestamp())
-            text = [page.get_text() for page in doc]
-            if is_lan_detect:
-                language = str(detector.detect_language_of(" ".join(text)).name).lower()
-            else:
-                language = "None"
-            
-            # xref
-            xref = []
+            return [page.get_text() for page in doc]
+        except Exception as e:
+            logger.warning(f"Failed to extract text: {e}")
+            return []
+
+    def _extract_xref(self, doc: pymupdf.Document) -> List[str]:
+        """
+        Extracts xref subtype keys from the PDF document.
+
+        Args:
+            doc: The opened pymupdf Document object.
+        Returns:
+            List of unique xref subtype keys.
+        """
+        xref = []
+        try:
             for xref_idx in range(1, doc.xref_length()):
                 exists, xref_key = doc.xref_get_key(xref_idx, "Subtype")
                 if exists and xref_key != "null":
                     xref.append(xref_key)
-            xref = list(set(xref))
+            return list(set(xref))
+        except Exception as e:
+            logger.warning(f"Failed to extract xref: {e}")
+            return []
 
-            # toc - keep as structured data instead of string concatenation
+    def _extract_toc(self, doc: pymupdf.Document) -> List[str]:
+        """
+        Extracts the table of contents from the PDF document.
+
+        Args:
+            doc: The opened pymupdf Document object.
+        Returns:
+            List of toc entries as formatted strings.
+        """
+        try:
             toc_raw = doc.get_toc()
-            toc = [
-                {
-                    "level": item[0],  # 层级级别 (1, 2, 3, ...)
-                    "title": item[1],  # 标题文本
-                    "page": item[2],  # 页码
-                }
-                for item in toc_raw
-            ]
-            toc = [
-                f"{item['level']}|||{item['title']}|||{item['page']}"
-                for item in toc
-            ]
+            toc = [f"{item[0]}|||{item[1]}|||{item[2]}" for item in toc_raw]
+            return toc
+        except Exception as e:
+            logger.warning(f"Failed to extract TOC: {e}")
+            return []
 
+    def _extract_page_images(self, doc: pymupdf.Document) -> List[str]:
+        """
+        Extracts base64-encoded images for each page in the PDF document.
+
+        Args:
+            doc: The opened pymupdf Document object.
+        Returns:
+            List of base64-encoded images (as strings), one per page.
+        """
+        page_image = []
+        try:
+            for page_idx in range(doc.page_count):
+                page = doc.load_page(page_idx)
+                pixmap = page.get_pixmap()
+                page_image.append(base64.b64encode(pixmap.tobytes()).decode("utf-8"))
+            return page_image
+        except Exception as e:
+            logger.warning(f"Failed to extract page images: {e}")
+            return []
+
+    def _detect_language(
+        self, text: List[str], detector: Optional[LanguageDetector]
+    ) -> str:
+        """
+        Detects the language of the concatenated text using the provided detector.
+
+        Args:
+            text: List of text strings from the PDF.
+            detector: Optional LanguageDetector instance.
+        Returns:
+            Detected language as a string, or 'None' if not detected.
+        """
+        if detector is None:
+            return "None"
+        try:
+            return str(detector.detect_language_of(" ".join(text)).name).lower()
+        except Exception as e:
+            logger.warning(f"Failed to detect language: {e}")
+            return "None"
+
+    @staticmethod
+    def from_file(
+        file_path: Path,
+        lan_detect: bool = False,
+        detector: Optional[LanguageDetector] = None,
+        page_save: bool = False,
+    ) -> Optional["PDFContent"]:
+        """
+        Reads a PDF file and extracts its content.
+        Args:
+            file_path: The  absolute path to the PDF file.
+            is_lan_detect: Whether to detect the language of the text.
+            detector: An optional LanguageDetector instance.
+            page_save: Whether to save page images as base64.
+        Returns:
+            A PDFContent object containing the extracted information, or None if an error occurs.
+        """
+        file_path = Path(file_path).absolute()
+        if not file_path.exists():
+            logger.error(f"PDF file does not exist: {file_path}")
+            return None
+        try:
+            doc = pymupdf.open(file_path)
+            metadata = doc.metadata
+            timestamp = int(datetime.now().timestamp())
+            temp_instance = PDFContent()
+            text = temp_instance._extract_text(doc)
+            language = (
+                temp_instance._detect_language(text, detector)
+                if lan_detect
+                else "None"
+            )
+            xref = temp_instance._extract_xref(doc)
+            toc = temp_instance._extract_toc(doc)
+            page_image = temp_instance._extract_page_images(doc) if page_save else []
         except Exception as e:
             logger.exception(f"Error reading PDF file {file_path}: {e}")
             return None
-
         file_available = True
-
         if file_available:
-            # check metadata info
             metadata = pdf_metadata_refine(metadata)
-
         return PDFContent(
             file_path=str(file_path),
             file_size=round(Path(file_path).stat().st_size / 1024 / 1024, 2),
@@ -157,6 +231,7 @@ class PDFContent(BaseModel):
             timestamp=str(timestamp),
             language=language,
             text=text,
+            page=page_image,
             xref=xref,
             toc=toc,
         )
@@ -168,10 +243,10 @@ class PDFContent(BaseModel):
 def get_processed_files(output_file: Path) -> Set[str]:
     """
     Reads the set of processed file paths from the output JSONL file.
-    
+
     Args:
         output_file: The path to the output JSONL file.
-        
+
     Returns:
         A set of file paths that have already been processed.
     """
@@ -184,58 +259,52 @@ def get_processed_files(output_file: Path) -> Set[str]:
     return processed
 
 
-def main() -> None:
-    """
-    Main function to process PDF files and extract content.
-    """
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Extract text and metadata from PDF files and save to JSONL format"
     )
     parser.add_argument(
-        "-i",
-        "--input_file",
-        type=str,
-        required=True,
-        help="The input file list (txt file with paths) or single PDF file",
+        "-i", "--input", type=Path, required=True,
+        help="Input file list (txt with paths) or single PDF file"
     )
     parser.add_argument(
-        "-o",
-        "--output_file",
-        type=str,
-        required=False,
-        help="The output jsonl file",
-        default="output.jsonl",
+        "-o", "--output", type=Path, default=Path("output.jsonl"),
+        help="Output JSONL file (default: output.jsonl)"
     )
     parser.add_argument(
-        "-l",
-        "--log_file",
-        type=str,
-        required=False,
-        help="The log file",
-        default="log.log",
+        "-l", "--log", type=Path, default=Path("log.log"),
+        help="Log file (default: log.log)"
     )
     parser.add_argument(
-        "-d",
-        "--lan_detect",
-        action="store_true",
-        help="Enable language detection for PDF content",
+        "-d", "--lan-detect", action="store_true",
+        help="Enable language detection for PDF content"
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from previous processing (skip already processed files)",
+        "-p", "--page-save", action="store_true",
+        help="Save page images for PDF content"
     )
-    args = parser.parse_args()
-    
-    input_file = Path(args.input_file).absolute()
-    output_file = Path(args.output_file).absolute()
-    log_file = Path(args.log_file).absolute()
-    lan_detect = args.lan_detect
-    resume = args.resume
+    parser.add_argument(
+        "-r", "--resume", action="store_true",
+        help="Resume from previous processing (skip already processed files)"
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    input_file: Path = args.input.resolve()
+    output_file: Path = args.output.resolve()
+    log_file: Path = args.log.resolve()
+    lan_detect: bool = args.lan_detect
+    page_save: bool = args.page_save
+    resume: bool = args.resume
 
     # Configure logging
     logger.add(log_file, rotation="500 MB", retention="10 days")
-    logger.info(f"Starting PDF processing - Resume: {resume}, Language Detection: {lan_detect}")
+    logger.info(
+        f"Starting PDF processing - Resume: {resume}, Language Detection: {lan_detect}"
+    )
 
     # Validate input file
     if not input_file.exists():
@@ -246,7 +315,9 @@ def main() -> None:
     if input_file.suffix == ".txt":
         try:
             input_list = input_file.read_text(encoding="utf-8").splitlines()
-            input_list = [input_file.parent / file.strip() for file in input_list if file.strip()]
+            input_list = [
+                input_file.parent / file.strip() for file in input_list if file.strip()
+            ]
             logger.info(f"Input file list: {input_file}, {len(input_list)} files")
         except Exception as e:
             logger.error(f"Error reading input file list: {e}")
@@ -291,14 +362,16 @@ def main() -> None:
     # Process files
     success_count = 0
     error_count = 0
-    
+
     with jsonlines.open(output_file, mode="a") as writer:
         for input_file in tqdm(files_to_process, desc="Processing PDFs", leave=False):
-            pdf_content = PDFContent.from_file(input_file, lan_detect, detector)
+            pdf_content = PDFContent.from_file(
+                input_file, lan_detect, detector, page_save
+            )
             if pdf_content is None:
                 error_count += 1
                 continue
-            
+
             try:
                 writer.write(pdf_content.to_dict())
                 success_count += 1
@@ -310,7 +383,9 @@ def main() -> None:
                 error_count += 1
 
     # Summary
-    logger.info(f"Processing completed - Success: {success_count}, Errors: {error_count}")
+    logger.info(
+        f"Processing completed - Success: {success_count}, Errors: {error_count}"
+    )
     print(f"Processing completed - Success: {success_count}, Errors: {error_count}")
 
 
