@@ -34,6 +34,7 @@ python main.py -i filelist.txt -o output.jsonl
 | -i, --input         | 输入 PDF 文件或包含 PDF 路径的 txt   |
 | -o, --output        | 输出 JSONL 文件（默认 output.jsonl） |
 | -l, --log           | 日志文件（默认 log.log）             |
+| -m, --max-lines     | 每个输出文件最大行数（默认 100000）  |
 | -d, --lan-detect    | 启用语言检测（可选）                 |
 | -p, --page-save     | 保存每页图片（base64，体积大，选用）  |
 | -r, --resume        | 断点续跑，跳过已处理文件（可选）      |
@@ -52,6 +53,12 @@ python main.py -i filelist.txt -o result.jsonl -d
 
 # 断点续跑
 python main.py -i filelist.txt -o result.jsonl -r
+
+# 自定义每个文件最大行数（5万行）
+python main.py -i filelist.txt -o result.jsonl -m 50000
+
+# 组合使用：语言检测 + 自定义行数 + 断点续跑
+python main.py -i filelist.txt -o result.jsonl -d -m 50000 -r
 ```
 
 ## 输入文件格式
@@ -71,6 +78,14 @@ python main.py -i filelist.txt -o result.jsonl -r
   - `text`：每页文本内容
   - `xref`：交叉引用类型
   - `toc`：目录结构
+
+### 文件分割
+
+当处理大量文件时，程序会自动分割输出文件：
+- 默认每个文件最多 10 万行
+- 可通过 `-m/--max-lines` 参数自定义
+- 文件命名格式：`output_001.jsonl`, `output_002.jsonl` 等
+- 支持断点续跑，自动从上次分割位置继续
 
 ## 日志与错误处理
 
