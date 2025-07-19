@@ -32,12 +32,47 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
     # {"format": "PDF 1.4", "title": "", "author": "", "subject": "", "keywords": "", "creator": "", "producer": "", "creationDate": "", "modDate": "", "trapped": "", "encryption": "None"}
     for key, value in metadata.items():
         if "Date" in key:  # creationDate, modDate
-            timestamp = int(datetime.now().timestamp())  # 默认值
+            timestamp = "0"  # 特殊时间戳：1970-01-01 00:00:00 UTC，字符串格式
             try:
                 if isinstance(value, str):
-                    # 使用 dateutil.parser 智能解析各种日期格式
-                    dt = parser.parse(value, fuzzy=True)
-                    timestamp = int(dt.timestamp())
+                    # 优先使用 dateutil.parser 智能解析各种日期格式
+                    try:
+                        dt = parser.parse(value, fuzzy=True)
+                        timestamp = str(int(dt.timestamp()))
+                    except Exception as parse_error:
+                        # 如果 dateutil.parser 失败，尝试特殊处理 D: 格式
+                        if value.startswith("D:"):
+                            # 处理 D:YYYYMMDDHHMMSSOHH'mm' 格式
+                            # 例如: D:20240101120000+00'00' 或 D:20240101120000Z
+                            try:
+                                # 提取日期时间部分 (去掉 D: 前缀)
+                                date_part = value[2:]
+                                
+                                # 处理带时区的格式
+                                if "'" in date_part:
+                                    # 格式: D:YYYYMMDDHHMMSS+HH'mm' 或 D:YYYYMMDDHHMMSS-HH'mm'
+                                    # 移除时区部分，只保留日期时间
+                                    date_part = date_part.split("'")[0]
+                                    if len(date_part) >= 14:
+                                        dt = datetime.strptime(date_part[:14], "%Y%m%d%H%M%S")
+                                        timestamp = str(int(dt.timestamp()))
+                                elif date_part.endswith('Z'):
+                                    # 格式: D:YYYYMMDDHHMMSSZ (UTC时间)
+                                    if len(date_part) >= 15:  # 包含Z
+                                        dt = datetime.strptime(date_part[:14], "%Y%m%d%H%M%S")
+                                        timestamp = str(int(dt.timestamp()))
+                                else:
+                                    # 简单格式: D:YYYYMMDDHHMMSS
+                                    if len(date_part) >= 14:
+                                        dt = datetime.strptime(date_part[:14], "%Y%m%d%H%M%S")
+                                        timestamp = str(int(dt.timestamp()))
+                            except Exception as d_format_error:
+                                logger.warning(f"Failed to parse D: format date {key}={value}: {d_format_error}")
+                                # 继续使用默认时间戳
+                                pass
+                        else:
+                            # 不是 D: 格式，记录 dateutil.parser 的解析错误
+                            logger.warning(f"Failed to parse date with dateutil.parser {key}={value}: {parse_error}")
                 # 如果 value 不是字符串或格式不匹配，使用默认的 timestamp
             except Exception as e:
                 logger.warning(f"Failed to parse date {key}={value}: {e}")
@@ -241,8 +276,46 @@ class PDFContent(BaseModel):
         if not file_path.exists():
             logger.error(f"PDF file does not exist: {file_path}")
             return None
+        
+        # 检查文件路径长度
+        file_path_str = str(file_path)
+        if len(file_path_str) > 260:
+            logger.error(f"File path too long ({len(file_path_str)} chars): {file_path}")
+            return None
+        
+        # 检查文件大小
         try:
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                logger.error(f"PDF file is empty: {file_path}")
+                return None
+            if file_size > 500 * 1024 * 1024:  # 500MB
+                logger.warning(f"PDF file is very large ({file_size / 1024 / 1024:.1f}MB): {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to get file size for {file_path}: {e}")
+            return None
+        
+        try:
+            # 尝试打开 PDF 文件
             doc = pymupdf.open(file_path)
+            
+            # 检查 PDF 是否有效
+            if doc.page_count == 0:
+                logger.warning(f"PDF has no pages: {file_path}")
+                doc.close()
+                return None
+                
+        except pymupdf.FileDataError as e:
+            logger.error(f"PDF file data error for {file_path}: {e}")
+            return None
+        except pymupdf.FileDataError as e:
+            logger.error(f"PDF file format error for {file_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to open PDF file {file_path}: {e}")
+            return None
+        
+        try:
             metadata = doc.metadata
             timestamp = int(datetime.now().timestamp())
             temp_instance = PDFContent()
@@ -255,9 +328,18 @@ class PDFContent(BaseModel):
             xref = temp_instance._extract_xref(doc)
             toc = temp_instance._extract_toc(doc)
             page_image = temp_instance._extract_page_images(doc) if page_save else []
+            
+            # 确保关闭文档
+            doc.close()
+            
         except Exception as e:
-            logger.exception(f"Error reading PDF file {file_path}: {e}")
+            logger.exception(f"Error processing PDF file {file_path}: {e}")
+            try:
+                doc.close()
+            except:
+                pass
             return None
+        
         file_available = True
         if file_available:
             metadata = pdf_metadata_refine(metadata)
