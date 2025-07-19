@@ -10,6 +10,7 @@ from lingua import LanguageDetector, LanguageDetectorBuilder
 from tqdm import tqdm
 from typing import Optional, Dict, List, Any, Set
 import base64
+from dateutil import parser
 
 
 def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,20 +32,16 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
     # {"format": "PDF 1.4", "title": "", "author": "", "subject": "", "keywords": "", "creator": "", "producer": "", "creationDate": "", "modDate": "", "trapped": "", "encryption": "None"}
     for key, value in metadata.items():
         if "Date" in key:  # creationDate, modDate
+            timestamp = int(datetime.now().timestamp())  # 默认值
             try:
-                if isinstance(value, str) and value.startswith("D:"):
-                    date_part = value[2:16]
-                    if len(date_part) >= 14:
-                        dt = datetime.strptime(date_part[:14], "%Y%m%d%H%M%S")
-                        timestamp = int(dt.timestamp())
-                elif isinstance(value, str) and len(value) >= 8:
-                    dt = datetime.strptime(value[:8], "%Y%m%d")
+                if isinstance(value, str):
+                    # 使用 dateutil.parser 智能解析各种日期格式
+                    dt = parser.parse(value, fuzzy=True)
                     timestamp = int(dt.timestamp())
-                else:
-                    timestamp = int(datetime.now().timestamp())
+                # 如果 value 不是字符串或格式不匹配，使用默认的 timestamp
             except Exception as e:
                 logger.warning(f"Failed to parse date {key}={value}: {e}")
-                timestamp = int(datetime.now().timestamp())
+                # timestamp 保持默认值
 
             metadata[key] = timestamp
     return metadata
@@ -100,7 +97,33 @@ class PDFContent(BaseModel):
             List of text strings, one per page.
         """
         try:
-            return [page.get_text() for page in doc]
+            text_pages = []
+            for page in doc:
+                try:
+                    # 获取原始文本
+                    raw_text = page.get_text()
+                    
+                    # 如果文本为空或None，跳过
+                    if not raw_text:
+                        text_pages.append("")
+                        continue
+                    
+                    # 尝试处理编码问题
+                    if isinstance(raw_text, str):
+                        # 清理常见的编码问题
+                        cleaned_text = raw_text.encode('utf-8', errors='ignore').decode('utf-8')
+                        # 移除不可见字符，但保留换行符和空格
+                        cleaned_text = ''.join(char for char in cleaned_text if char.isprintable() or char in '\n\r\t')
+                        text_pages.append(cleaned_text)
+                    else:
+                        # 如果不是字符串，尝试转换
+                        text_pages.append(str(raw_text))
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to extract text from page: {e}")
+                    text_pages.append("")
+                    
+            return text_pages
         except Exception as e:
             logger.warning(f"Failed to extract text: {e}")
             return []
@@ -177,7 +200,22 @@ class PDFContent(BaseModel):
         if detector is None:
             return "None"
         try:
-            return str(detector.detect_language_of(" ".join(text)).name).lower()
+            # 检查文本是否为空
+            if not text or not any(text):
+                return "None"
+            
+            # 连接文本并检测语言
+            combined_text = " ".join(text)
+            if not combined_text.strip():
+                return "None"
+                
+            detected_language = detector.detect_language_of(combined_text)
+            
+            # 检查检测结果是否为None
+            if detected_language is None:
+                return "None"
+                
+            return str(detected_language.name).lower()
         except Exception as e:
             logger.warning(f"Failed to detect language: {e}")
             return "None"
@@ -276,6 +314,10 @@ def parse_args():
         help="Log file (default: log.log)"
     )
     parser.add_argument(
+        "-m", "--max-lines", type=int, default=100000,
+        help="Maximum lines per output file (default: 100000)"
+    )
+    parser.add_argument(
         "-d", "--lan-detect", action="store_true",
         help="Enable language detection for PDF content"
     )
@@ -359,11 +401,63 @@ def main() -> None:
 
     logger.info(f"Files to process: {len(files_to_process)}")
 
-    # Process files
+    # Process files with line counting and file rotation
     success_count = 0
     error_count = 0
+    current_line_count = 0
+    current_file_index = 1
+    max_lines_per_file = args.max_lines  # 使用命令行参数
+    
+    # 获取当前输出文件的基础信息
+    output_stem = output_file.stem
+    output_suffix = output_file.suffix
+    output_parent = output_file.parent
+    
+    # 如果resume模式，需要找到最后一个文件的行数
+    if resume:
+        # 查找已存在的文件，确定当前文件索引和行数
+        existing_files = list(output_parent.glob(f"{output_stem}_*{output_suffix}"))
+        if existing_files:
+            # 按文件名排序，找到最后一个文件
+            existing_files.sort()
+            last_file = existing_files[-1]
+            # 从文件名中提取索引
+            try:
+                # 提取文件名中的数字部分
+                filename = last_file.stem
+                index_str = filename.split('_')[-1]
+                current_file_index = int(index_str)
+                # 计算最后一个文件的行数
+                with jsonlines.open(last_file, mode="r") as reader:
+                    current_line_count = sum(1 for _ in reader)
+                logger.info(f"Resume: found existing file {last_file} with {current_line_count} lines")
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse file index from {last_file}, starting fresh")
+                current_file_index = 1
+                current_line_count = 0
+    
+    def get_current_output_file() -> Path:
+        """获取当前输出文件路径"""
+        # 估算总文件数量，动态设置索引格式
+        estimated_total_files = max(10, len(files_to_process) // (max_lines_per_file // 100) + 1)
+        # 计算需要的位数：log10(estimated_total_files) + 1，最小2位
+        digits = max(2, len(str(estimated_total_files)))
+        index_format = f"0{digits}d"
+        
+        return output_parent / f"{output_stem}_{current_file_index:{index_format}}{output_suffix}"
+    
+    def switch_to_next_file():
+        """切换到下一个输出文件"""
+        nonlocal current_file_index, current_line_count
+        current_file_index += 1
+        current_line_count = 0
+        new_file = get_current_output_file()
+        logger.info(f"Switching to new output file: {new_file}")
+        return new_file
 
-    with jsonlines.open(output_file, mode="a") as writer:
+    current_output_file = get_current_output_file()
+    
+    with jsonlines.open(current_output_file, mode="a") as writer:
         for input_file in tqdm(files_to_process, desc="Processing PDFs", leave=False):
             pdf_content = PDFContent.from_file(
                 input_file, lan_detect, detector, page_save
@@ -375,6 +469,17 @@ def main() -> None:
             try:
                 writer.write(pdf_content.to_dict())
                 success_count += 1
+                current_line_count += 1
+                
+                # 检查是否需要切换到下一个文件
+                if current_line_count >= max_lines_per_file:
+                    # 关闭当前文件
+                    writer.close()
+                    # 切换到下一个文件
+                    current_output_file = switch_to_next_file()
+                    # 重新打开新文件
+                    writer = jsonlines.open(current_output_file, mode="a")
+                    
             except UnicodeEncodeError as e:
                 logger.exception(f"UnicodeEncodeError for file {input_file}: {e}")
                 error_count += 1
@@ -384,9 +489,9 @@ def main() -> None:
 
     # Summary
     logger.info(
-        f"Processing completed - Success: {success_count}, Errors: {error_count}"
+        f"Processing completed - Success: {success_count}, Errors: {error_count}, Files created: {current_file_index}"
     )
-    print(f"Processing completed - Success: {success_count}, Errors: {error_count}")
+    print(f"Processing completed - Success: {success_count}, Errors: {error_count}, Files created: {current_file_index}")
 
 
 if __name__ == "__main__":
