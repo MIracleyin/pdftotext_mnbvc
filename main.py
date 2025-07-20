@@ -32,6 +32,8 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
     # {"format": "PDF 1.4", "title": "", "author": "", "subject": "", "keywords": "", "creator": "", "producer": "", "creationDate": "", "modDate": "", "trapped": "", "encryption": "None"}
     for key, value in metadata.items():
         if "Date" in key:  # creationDate, modDate
+            # 保存原始值
+            original_value = value
             timestamp = "0"  # 特殊时间戳：1970-01-01 00:00:00 UTC，字符串格式
             try:
                 if isinstance(value, str):
@@ -73,10 +75,22 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             # 不是 D: 格式，记录 dateutil.parser 的解析错误
                             logger.warning(f"Failed to parse date with dateutil.parser {key}={value}: {parse_error}")
+                            timestamp = f"dateutilparser_error||||{value}"
                 # 如果 value 不是字符串或格式不匹配，使用默认的 timestamp
             except Exception as e:
                 logger.warning(f"Failed to parse date {key}={value}: {e}")
                 # timestamp 保持默认值
+
+            # 如果解析失败（timestamp 仍为 "0"），保存原始值
+            if timestamp == "0" and original_value:
+                # 处理原始值为字符串格式
+                if isinstance(original_value, str):
+                    # 清理字符串，移除不可见字符
+                    cleaned_value = ''.join(char for char in original_value if char.isprintable() or char in '\n\r\t')
+                    timestamp = f"no_processed||||{cleaned_value}"
+                else:
+                    # 非字符串类型，转换为字符串
+                    timestamp = f"no_processed||||{str(original_value)}"
 
             metadata[key] = timestamp
     return metadata
