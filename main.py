@@ -13,6 +13,59 @@ import base64
 from dateutil import parser
 
 
+def clean_unicode_string(text: str) -> str:
+    """
+    Clean Unicode string by removing surrogates and invalid characters.
+    
+    Args:
+        text: Input text string
+        
+    Returns:
+        Cleaned text safe for UTF-8 encoding
+    """
+    if not isinstance(text, str):
+        return str(text)
+    
+    try:
+        # 首先处理代理字符对
+        # 代理字符在Unicode中是0xD800-0xDFFF范围
+        cleaned_chars = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            code_point = ord(char)
+            
+            # 检查是否为代理字符
+            if 0xD800 <= code_point <= 0xDFFF:
+                # 跳过代理字符
+                i += 1
+                continue
+            
+            # 检查是否为有效的可打印字符或允许的空白字符
+            if char.isprintable() or char in '\n\r\t':
+                cleaned_chars.append(char)
+            
+            i += 1
+        
+        cleaned_text = ''.join(cleaned_chars)
+        
+        # 验证是否可以编码为UTF-8
+        try:
+            cleaned_text.encode('utf-8')
+            return cleaned_text
+        except UnicodeEncodeError:
+            # 如果仍然有问题，使用更激进的清理方法
+            return cleaned_text.encode('utf-8', errors='ignore').decode('utf-8')
+            
+    except Exception as e:
+        logger.warning(f"Failed to clean Unicode string: {e}")
+        # 最后的备用方案：直接使用ignore错误
+        try:
+            return text.encode('utf-8', errors='ignore').decode('utf-8')
+        except Exception:
+            return ""
+
+
 def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Refine PDF metadata by converting date strings to timestamps.
@@ -29,6 +82,11 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
         >>> isinstance(refined["creationDate"], int)
         True
     """
+    # 处理None metadata
+    if metadata is None:
+        logger.warning("PDF metadata is None, using empty dictionary")
+        metadata = {}
+    
     # {"format": "PDF 1.4", "title": "", "author": "", "subject": "", "keywords": "", "creator": "", "producer": "", "creationDate": "", "modDate": "", "trapped": "", "encryption": "None"}
     for key, value in metadata.items():
         if "Date" in key:  # creationDate, modDate
@@ -85,14 +143,19 @@ def pdf_metadata_refine(metadata: Dict[str, Any]) -> Dict[str, Any]:
             if timestamp == "0" and original_value:
                 # 处理原始值为字符串格式
                 if isinstance(original_value, str):
-                    # 清理字符串，移除不可见字符
-                    cleaned_value = ''.join(char for char in original_value if char.isprintable() or char in '\n\r\t')
+                    # 清理字符串，移除代理字符和不可见字符
+                    cleaned_value = clean_unicode_string(original_value)
                     timestamp = f"no_processed||||{cleaned_value}"
                 else:
                     # 非字符串类型，转换为字符串
                     timestamp = f"no_processed||||{str(original_value)}"
 
             metadata[key] = timestamp
+        
+        # 清理所有其他字符串字段
+        for key, value in metadata.items():
+            if isinstance(value, str) and "Date" not in key:
+                metadata[key] = clean_unicode_string(value)
     return metadata
 
 
@@ -136,6 +199,18 @@ class PDFContent(BaseModel):
         default_factory=list, description="The table of contents of the PDF file"
     )
 
+    def _clean_unicode_text(self, text: str) -> str:
+        """
+        Clean Unicode text by removing surrogates and invalid characters.
+        
+        Args:
+            text: Input text string
+            
+        Returns:
+            Cleaned text safe for UTF-8 encoding
+        """
+        return clean_unicode_string(text)
+
     def _extract_text(self, doc: pymupdf.Document) -> List[str]:
         """
         Extracts text from all pages of the PDF document.
@@ -159,10 +234,8 @@ class PDFContent(BaseModel):
                     
                     # 尝试处理编码问题
                     if isinstance(raw_text, str):
-                        # 清理常见的编码问题
-                        cleaned_text = raw_text.encode('utf-8', errors='ignore').decode('utf-8')
-                        # 移除不可见字符，但保留换行符和空格
-                        cleaned_text = ''.join(char for char in cleaned_text if char.isprintable() or char in '\n\r\t')
+                        # 清理代理字符和编码问题
+                        cleaned_text = self._clean_unicode_text(raw_text)
                         text_pages.append(cleaned_text)
                     else:
                         # 如果不是字符串，尝试转换
